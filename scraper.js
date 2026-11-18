@@ -1,4 +1,3 @@
-```javascript
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -335,4 +334,3 @@ main().catch(async function (err) {
   } catch (e) {}
   process.exit(1);
 });
-```
