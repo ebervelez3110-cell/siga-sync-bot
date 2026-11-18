@@ -6,7 +6,7 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('❌ Faltan variables de entorno SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY');
+  console.error('Faltan variables de entorno SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
 
@@ -22,7 +22,7 @@ function decodificarJwtExp(urlStr) {
     const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
     const json = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
     return json.exp ? new Date(json.exp * 1000) : null;
-  } catch {
+  } catch (e) {
     return null;
   }
 }
@@ -35,10 +35,10 @@ function parseHoraFecha(rawText, fallbackFechaIso) {
   const mDate = txt.match(/(\d{2})\/(\d{2})\/(\d{4})/);
   let fecha = fallbackFechaIso;
   if (mDate) {
-    fecha = `${mDate[3]}-${mDate[2]}-${mDate[1]}`;
+    fecha = mDate[3] + '-' + mDate[2] + '-' + mDate[1];
   }
-  const horaTs = `${fecha}T${hora}:00-05:00`;
-  return { hora, fecha, horaTs };
+  const horaTs = fecha + 'T' + hora + ':00-05:00';
+  return { hora: hora, fecha: fecha, horaTs: horaTs };
 }
 
 function fechaHoyLima() {
@@ -48,23 +48,18 @@ function fechaHoyLima() {
 }
 
 async function actualizarEstadoConfig(patch) {
-  await sb.from('siga_config').upsert(
-    { id: 'LIM', updated_at: new Date().toISOString(), ...patch },
-    { onConflict: 'id' }
-  );
+  const payload = Object.assign({ id: 'LIM', updated_at: new Date().toISOString() }, patch);
+  await sb.from('siga_config').upsert(payload, { onConflict: 'id' });
 }
 
 async function main() {
-  console.log('🚀 Iniciando sincronización SIGA v2...');
-  const { data: cfg, error: cfgErr } = await sb
-    .from('siga_config')
-    .select('*')
-    .eq('id', 'LIM')
-    .maybeSingle();
+  console.log('Iniciando sincronizacion SIGA v2...');
+  const resCfg = await sb.from('siga_config').select('*').eq('id', 'LIM').maybeSingle();
+  if (resCfg.error) throw resCfg.error;
+  const cfg = resCfg.data;
 
-  if (cfgErr) throw cfgErr;
   if (!cfg || !cfg.url_siga || !cfg.url_siga.trim().startsWith('http')) {
-    console.log('ℹ️ No hay link SIGA configurado en siga_config.');
+    console.log('No hay link SIGA configurado en siga_config.');
     await actualizarEstadoConfig({ estado: 'SIN_LINK', ultimo_error: 'Pega un link vigente en CCO.' });
     return;
   }
@@ -72,11 +67,11 @@ async function main() {
   const urlSiga = cfg.url_siga.trim();
   const expDate = decodificarJwtExp(urlSiga);
   if (expDate && expDate.getTime() < Date.now()) {
-    console.log(`⚠️ Link SIGA vencido desde ${expDate.toISOString()}`);
+    console.log('Link SIGA vencido desde ' + expDate.toISOString());
     await actualizarEstadoConfig({
       estado: 'VENCIDO',
       token_exp: expDate.toISOString(),
-      ultimo_error: 'El enlace de 48h venció. Pega uno nuevo en CCO.'
+      ultimo_error: 'El enlace de 48h vencio. Pega uno nuevo en CCO.'
     });
     return;
   }
@@ -90,29 +85,28 @@ async function main() {
     });
     const page = await context.newPage();
 
-    console.log('🌐 Abriendo pizarra...');
+    console.log('Abriendo pizarra...');
     await page.goto(urlSiga, { waitUntil: 'networkidle', timeout: 60000 });
 
-    // Esperar a que aparezcan filas con códigos de vuelo (ej. LA2357)
-    await page.waitForFunction(() => {
+    await page.waitForFunction(function () {
       const txt = document.body ? document.body.innerText : '';
       return /\b[A-Z]{2}\d{3,4}\b/.test(txt);
     }, { timeout: 45000 });
 
     await page.waitForTimeout(3000);
 
-    const extracted = await page.evaluate(() => {
-      const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const extracted = await page.evaluate(function () {
+      function clean(s) {
+        return String(s || '').replace(/\s+/g, ' ').trim();
+      }
       const tables = Array.from(document.querySelectorAll('table'));
-
-      // 1. Encontrar las filas de datos (soporta tabla única o tablas divididas thead/tbody)
       let mainTable = null;
       let maxRows = 0;
-      for (const t of tables) {
-        const count = t.querySelectorAll('tbody tr').length;
+      for (let i = 0; i < tables.length; i++) {
+        const count = tables[i].querySelectorAll('tbody tr').length;
         if (count > maxRows) {
           maxRows = count;
-          mainTable = t;
+          mainTable = tables[i];
         }
       }
 
@@ -121,26 +115,26 @@ async function main() {
 
       if (mainTable && maxRows > 0) {
         rows = Array.from(mainTable.querySelectorAll('tbody tr'))
-          .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => clean(td.innerText)))
-          .filter((r) => r.length >= 4);
+          .map(function (tr) {
+            return Array.from(tr.querySelectorAll('td')).map(function (td) { return clean(td.innerText); });
+          })
+          .filter(function (r) { return r.length >= 4; });
 
-        // Buscar cabeceras primero dentro de mainTable y si no hay, en TODAS las tablas del documento
-        const candidateHeaderRows = [
-          ...Array.from(mainTable.querySelectorAll('thead tr')),
-          ...Array.from(document.querySelectorAll('table thead tr'))
-        ];
+        const candidateHeaderRows = Array.from(mainTable.querySelectorAll('thead tr'))
+          .concat(Array.from(document.querySelectorAll('table thead tr')));
 
         const colCount = rows[0] ? rows[0].length : 0;
         let bestH = [];
         let bestScore = -1;
-        for (const hr of candidateHeaderRows) {
-          const hs = Array.from(hr.querySelectorAll('th, td')).map((el) => clean(el.innerText).toUpperCase());
+        for (let j = 0; j < candidateHeaderRows.length; j++) {
+          const hs = Array.from(candidateHeaderRows[j].querySelectorAll('th, td'))
+            .map(function (el) { return clean(el.innerText).toUpperCase(); });
           if (!hs.length) continue;
           let score = 0;
-          if (hs.some((h) => h.includes('VUELO') || h === 'VOO')) score += 5;
-          if (hs.some((h) => h.includes('ETA'))) score += 3;
-          if (hs.some((h) => h.includes('ETD'))) score += 3;
-          if (hs.some((h) => h.includes('PREFIX') || h.includes('MATR'))) score += 4;
+          if (hs.some(function (h) { return h.indexOf('VUELO') >= 0 || h === 'VOO'; })) score += 5;
+          if (hs.some(function (h) { return h.indexOf('ETA') >= 0; })) score += 3;
+          if (hs.some(function (h) { return h.indexOf('ETD') >= 0; })) score += 3;
+          if (hs.some(function (h) { return h.indexOf('PREFIX') >= 0 || h.indexOf('MATR') >= 0; })) score += 4;
           if (colCount && hs.length === colCount) score += 6;
           score += hs.length * 0.05;
           if (score > bestScore) {
@@ -151,93 +145,108 @@ async function main() {
         headers = bestH;
       }
 
-      // 2. Fallback si la pizarra usa grid ARIA en vez de <table>
       if (!rows.length) {
         const ariaHeaders = Array.from(document.querySelectorAll('[role="columnheader"]'))
-          .map((el) => clean(el.innerText).toUpperCase());
+          .map(function (el) { return clean(el.innerText).toUpperCase(); });
         const ariaRows = Array.from(document.querySelectorAll('[role="row"]'))
-          .map((r) => Array.from(r.querySelectorAll('[role="cell"], [role="gridcell"]')).map((c) => clean(c.innerText)))
-          .filter((r) => r.length >= 4);
+          .map(function (r) {
+            return Array.from(r.querySelectorAll('[role="cell"], [role="gridcell"]'))
+              .map(function (c) { return clean(c.innerText); });
+          })
+          .filter(function (r) { return r.length >= 4; });
         if (ariaRows.length) {
           headers = ariaHeaders;
           rows = ariaRows;
         }
       }
 
-      return { tableCount: tables.length, headers, rows };
+      return { tableCount: tables.length, headers: headers, rows: rows };
     });
 
-    const { tableCount, headers, rows } = extracted;
-    console.log(`🔎 Tablas en DOM: ${tableCount} | Cabeceras (${headers.length}):`, headers.join(' | '));
-    console.log(`📋 Filas detectadas: ${rows.length}`);
-    if (rows[0]) console.log('🧪 Ejemplo fila 0:', JSON.stringify(rows[0]));
+    const tableCount = extracted.tableCount;
+    const headers = extracted.headers;
+    const rows = extracted.rows;
+
+    console.log('Tablas en DOM: ' + tableCount + ' | Cabeceras (' + headers.length + '): ' + headers.join(' | '));
+    console.log('Filas detectadas: ' + rows.length);
+    if (rows[0]) console.log('Ejemplo fila 0: ' + JSON.stringify(rows[0]));
 
     if (!rows.length) {
       await actualizarEstadoConfig({
         estado: 'ERROR',
-        ultimo_error: 'La página cargó pero no se encontraron filas en la tabla.'
+        ultimo_error: 'La pagina cargo pero no se encontraron filas en la tabla.'
       });
       return;
     }
 
-    // Detectar índice de PREFIX por cabecera o por patrón de matrícula (CC-XXX, PR-XXX, etc.)
-    let idxPrefix = headers.findIndex((h) => h.includes('PREFIX') || h.includes('MATR'));
+    let idxPrefix = headers.findIndex(function (h) {
+      return h.indexOf('PREFIX') >= 0 || h.indexOf('MATR') >= 0;
+    });
     if (idxPrefix < 0) {
       const counts = {};
-      for (const r of rows.slice(0, 30)) {
-        r.forEach((val, idx) => {
+      rows.slice(0, 30).forEach(function (r) {
+        r.forEach(function (val, idx) {
           if (/^[A-Z]{2}-[A-Z0-9]{3,5}$/.test(val.trim())) {
             counts[idx] = (counts[idx] || 0) + 1;
           }
         });
-      }
-      const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-      if (best) idxPrefix = parseInt(best[0], 10);
+      });
+      const sorted = Object.entries(counts).sort(function (a, b) { return b[1] - a[1]; });
+      if (sorted[0]) idxPrefix = parseInt(sorted[0][0], 10);
     }
 
-    const findBefore = (pred, limit) => {
+    function findBefore(pred, limit) {
       const end = limit >= 0 ? limit : headers.length;
       for (let i = 0; i < end; i++) {
         if (pred(headers[i])) return i;
       }
       return -1;
-    };
-    const findAfter = (pred, start) => {
+    }
+    function findAfter(pred, start) {
       if (start < 0) return -1;
       for (let i = start + 1; i < headers.length; i++) {
         if (pred(headers[i])) return i;
       }
       return -1;
-    };
+    }
 
-    const idxArrVuelo = findBefore((h) => h === 'VUELO' || h.includes('VUELO') || h === 'VOO', idxPrefix);
-    const idxArrOrigen = findBefore((h) => h.includes('ORIGEN') || h.includes('ORIG'), idxPrefix);
-    const idxArrPea = findBefore((h) => h.includes('P.POS') || h.includes('POS'), idxPrefix);
-    const idxArrEta = findBefore((h) => h === 'ETA' || h.startsWith('ETA'), idxPrefix);
-    const idxArrSta = findBefore((h) => h === 'STA' || h.startsWith('STA'), idxPrefix);
+    const idxArrVuelo = findBefore(function (h) { return h === 'VUELO' || h.indexOf('VUELO') >= 0 || h === 'VOO'; }, idxPrefix);
+    const idxArrOrigen = findBefore(function (h) { return h.indexOf('ORIGEN') >= 0 || h.indexOf('ORIG') >= 0; }, idxPrefix);
+    const idxArrPea = findBefore(function (h) { return h.indexOf('P.POS') >= 0 || h.indexOf('POS') >= 0; }, idxPrefix);
+    const idxArrEta = findBefore(function (h) { return h === 'ETA' || h.indexOf('ETA') === 0; }, idxPrefix);
+    const idxArrSta = findBefore(function (h) { return h === 'STA' || h.indexOf('STA') === 0; }, idxPrefix);
 
-    const idxDepVuelo = findAfter((h) => h === 'VUELO' || h.includes('VUELO') || h === 'VOO', idxPrefix);
-    const idxDepDest = findAfter((h) => h.includes('DEST'), idxPrefix);
-    const idxDepPea = findAfter((h) => h.includes('P.POS') || h.includes('POS'), idxPrefix);
-    const idxDepEtd = findAfter((h) => h === 'ETD' || h.startsWith('ETD'), idxPrefix);
-    const idxDepStd = findAfter((h) => h === 'STD' || h.startsWith('STD'), idxPrefix);
+    const idxDepVuelo = findAfter(function (h) { return h === 'VUELO' || h.indexOf('VUELO') >= 0 || h === 'VOO'; }, idxPrefix);
+    const idxDepDest = findAfter(function (h) { return h.indexOf('DEST') >= 0; }, idxPrefix);
+    const idxDepPea = findAfter(function (h) { return h.indexOf('P.POS') >= 0 || h.indexOf('POS') >= 0; }, idxPrefix);
+    const idxDepEtd = findAfter(function (h) { return h === 'ETD' || h.indexOf('ETD') === 0; }, idxPrefix);
+    const idxDepStd = findAfter(function (h) { return h === 'STD' || h.indexOf('STD') === 0; }, idxPrefix);
 
-    console.log('🧭 Índices detectados:', JSON.stringify({
-      idxPrefix, idxArrVuelo, idxArrOrigen, idxArrPea, idxArrEta, idxArrSta,
-      idxDepVuelo, idxDepDest, idxDepPea, idxDepEtd, idxDepStd
+    console.log('Indices detectados: ' + JSON.stringify({
+      idxPrefix: idxPrefix,
+      idxArrVuelo: idxArrVuelo,
+      idxArrOrigen: idxArrOrigen,
+      idxArrPea: idxArrPea,
+      idxArrEta: idxArrEta,
+      idxArrSta: idxArrSta,
+      idxDepVuelo: idxDepVuelo,
+      idxDepDest: idxDepDest,
+      idxDepPea: idxDepPea,
+      idxDepEtd: idxDepEtd,
+      idxDepStd: idxDepStd
     }));
 
     const hoyLima = fechaHoyLima();
     const registrosMap = new Map();
-    const cleanVuelo = (v) => String(v || '').replace(/\s+/g, '').toUpperCase();
-    const cleanPea = (p) => String(p || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, '');
-    const cleanTxt = (m) => String(m || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, '');
+    function cleanVuelo(v) { return String(v || '').replace(/\s+/g, '').toUpperCase(); }
+    function cleanPea(p) { return String(p || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, ''); }
+    function cleanTxt(m) { return String(m || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, ''); }
 
-    for (const cells of rows) {
+    for (let r = 0; r < rows.length; r++) {
+      const cells = rows[r];
       if (!cells || cells.length < 4) continue;
       const matricula = idxPrefix >= 0 ? cleanTxt(cells[idxPrefix]) : '';
 
-      // LLEGADA (ACOPLE)
       if (idxArrVuelo >= 0) {
         const vuelo = cleanVuelo(cells[idxArrVuelo]);
         if (vuelo && vuelo !== '-' && /[A-Z0-9]{3,}/.test(vuelo)) {
@@ -246,23 +255,22 @@ async function main() {
             : (idxArrSta >= 0 ? cells[idxArrSta] : '');
           const parsed = parseHoraFecha(rawHora, hoyLima);
           if (parsed) {
-            const id = `${parsed.fecha}_${vuelo}_ACOPLE`;
+            const id = parsed.fecha + '_' + vuelo + '_ACOPLE';
             registrosMap.set(id, {
-              id,
+              id: id,
               fecha: parsed.fecha,
               tipo: 'ACOPLE',
-              vuelo,
+              vuelo: vuelo,
               ruta: idxArrOrigen >= 0 ? cleanTxt(cells[idxArrOrigen]) : '',
               pea: idxArrPea >= 0 ? cleanPea(cells[idxArrPea]) : '',
               hora_estimada: parsed.hora,
               hora_ts: parsed.horaTs,
-              matricula
+              matricula: matricula
             });
           }
         }
       }
 
-      // SALIDA (DESACOPLE)
       if (idxDepVuelo >= 0) {
         const vuelo = cleanVuelo(cells[idxDepVuelo]);
         if (vuelo && vuelo !== '-' && /[A-Z0-9]{3,}/.test(vuelo)) {
@@ -271,17 +279,17 @@ async function main() {
             : (idxDepStd >= 0 ? cells[idxDepStd] : '');
           const parsed = parseHoraFecha(rawHora, hoyLima);
           if (parsed) {
-            const id = `${parsed.fecha}_${vuelo}_DESACOPLE`;
+            const id = parsed.fecha + '_' + vuelo + '_DESACOPLE';
             registrosMap.set(id, {
-              id,
+              id: id,
               fecha: parsed.fecha,
               tipo: 'DESACOPLE',
-              vuelo,
+              vuelo: vuelo,
               ruta: idxDepDest >= 0 ? cleanTxt(cells[idxDepDest]) : '',
               pea: idxDepPea >= 0 ? cleanPea(cells[idxDepPea]) : '',
               hora_estimada: parsed.hora,
               hora_ts: parsed.horaTs,
-              matricula
+              matricula: matricula
             });
           }
         }
@@ -289,16 +297,14 @@ async function main() {
     }
 
     const registros = Array.from(registrosMap.values());
-    console.log(`✈️ Eventos normalizados (Llegadas + Salidas sin duplicados): ${registros.length}`);
-    if (registros[0]) console.log('🧪 Muestra registro 0:', JSON.stringify(registros[0]));
+    console.log('Eventos normalizados (Llegadas + Salidas): ' + registros.length);
+    if (registros[0]) console.log('Muestra registro 0: ' + JSON.stringify(registros[0]));
 
     if (registros.length > 0) {
       for (let i = 0; i < registros.length; i += 100) {
         const chunk = registros.slice(i, i + 100);
-        const { error: upErr } = await sb
-          .from('siga_vuelos')
-          .upsert(chunk, { onConflict: 'id' });
-        if (upErr) throw upErr;
+        const up = await sb.from('siga_vuelos').upsert(chunk, { onConflict: 'id' });
+        if (up.error) throw up.error;
       }
 
       const cutoff = new Date(Date.now() - 36 * 3600 * 1000).toISOString();
@@ -313,20 +319,20 @@ async function main() {
       ultimo_error: registros.length > 0 ? null : 'Se leyeron filas pero 0 vuelos normalizados (revisar cabeceras en Actions).'
     });
 
-    console.log('✅ Sincronización completada.');
+    console.log('Sincronizacion completada.');
   } finally {
     await browser.close();
   }
 }
 
-main().catch(async (err) => {
-  console.error('❌ Error en sincronización:', err);
+main().catch(async function (err) {
+  console.error('Error en sincronizacion:', err);
   try {
     await actualizarEstadoConfig({
       estado: 'ERROR',
-      ultimo_error: String(err.message || err).slice(0, 300)
+      ultimo_error: String(err && err.message ? err.message : err).slice(0, 300)
     });
-  } catch {}
+  } catch (e) {}
   process.exit(1);
 });
 ```
