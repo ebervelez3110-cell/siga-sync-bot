@@ -1,0 +1,13 @@
+{
+  "name": "siga-sync-bot",
+  "version": "1.0.0",
+  "description": "Sincronizador Playwright para leer vuelos de pizarra SIGA y guardarlos en Supabase sin duplicados",
+  "main": "scraper.js",
+  "scripts": {
+    "sync": "node scraper.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "playwright": "^1.48.0"
+  }
+}
