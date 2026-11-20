@@ -1,4 +1,3 @@
-
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -57,7 +56,7 @@ async function esperarTablaVuelos(page) {
     try {
       await page.waitForFunction(function () {
         const txt = document.body ? document.body.innerText : '';
-        return /\b[A-Z]{2}\d{3,4}\b/.test(txt);
+        return /\b[A-Z0-9]{2}\d{3,4}\b/.test(txt);
       }, null, { timeout: 45000 });
       return true;
     } catch (e) {
@@ -79,8 +78,144 @@ async function esperarTablaVuelos(page) {
   return false;
 }
 
+async function leerSnapshotTabla(page) {
+  return await page.evaluate(function () {
+    function clean(s) {
+      return String(s || '').replace(/\s+/g, ' ').trim();
+    }
+    const bodyTxt = document.body ? document.body.innerText : '';
+    const mItems = bodyTxt.match(/(\d+)\s+ITEMS/i);
+    const totalItemsReportado = mItems ? parseInt(mItems[1], 10) : null;
+
+    const tables = Array.from(document.querySelectorAll('table'));
+    let mainTable = null;
+    let maxRows = 0;
+    for (let i = 0; i < tables.length; i++) {
+      const count = tables[i].querySelectorAll('tbody tr').length;
+      if (count > maxRows) {
+        maxRows = count;
+        mainTable = tables[i];
+      }
+    }
+
+    let rows = [];
+    let headers = [];
+
+    if (mainTable && maxRows > 0) {
+      rows = Array.from(mainTable.querySelectorAll('tbody tr'))
+        .map(function (tr) {
+          return Array.from(tr.querySelectorAll('td')).map(function (td) { return clean(td.innerText); });
+        })
+        .filter(function (r) { return r.length >= 4; });
+
+      const candidateHeaderRows = Array.from(mainTable.querySelectorAll('thead tr'))
+        .concat(Array.from(document.querySelectorAll('table thead tr')));
+
+      const colCount = rows[0] ? rows[0].length : 0;
+      let bestH = [];
+      let bestScore = -1;
+      for (let j = 0; j < candidateHeaderRows.length; j++) {
+        const hs = Array.from(candidateHeaderRows[j].querySelectorAll('th, td'))
+          .map(function (el) { return clean(el.innerText).toUpperCase(); });
+        if (!hs.length) continue;
+        let score = 0;
+        if (hs.some(function (h) { return h.indexOf('VUELO') >= 0 || h === 'VOO'; })) score += 5;
+        if (hs.some(function (h) { return h.indexOf('ETA') >= 0; })) score += 3;
+        if (hs.some(function (h) { return h.indexOf('ETD') >= 0; })) score += 3;
+        if (hs.some(function (h) { return h.indexOf('PREFIX') >= 0 || h.indexOf('MATR') >= 0; })) score += 4;
+        if (colCount && hs.length === colCount) score += 6;
+        score += hs.length * 0.05;
+        if (score > bestScore) {
+          bestScore = score;
+          bestH = hs;
+        }
+      }
+      headers = bestH;
+    }
+
+    if (!rows.length) {
+      const ariaHeaders = Array.from(document.querySelectorAll('[role="columnheader"]'))
+        .map(function (el) { return clean(el.innerText).toUpperCase(); });
+      const ariaRows = Array.from(document.querySelectorAll('[role="row"]'))
+        .map(function (r) {
+          return Array.from(r.querySelectorAll('[role="cell"], [role="gridcell"]'))
+            .map(function (c) { return clean(c.innerText); });
+        })
+        .filter(function (r) { return r.length >= 4; });
+      if (ariaRows.length) {
+        headers = ariaHeaders;
+        rows = ariaRows;
+      }
+    }
+
+    return { totalItemsReportado: totalItemsReportado, headers: headers, rows: rows };
+  });
+}
+
+async function extraerTodasLasFilasConScroll(page) {
+  const rowMap = new Map();
+  let headers = [];
+  let totalItemsReportado = null;
+
+  function agregar(snap) {
+    if (snap.totalItemsReportado) totalItemsReportado = snap.totalItemsReportado;
+    if (snap.headers && snap.headers.length > headers.length) headers = snap.headers;
+    for (let i = 0; i < snap.rows.length; i++) {
+      const r = snap.rows[i];
+      const key = r.join('|');
+      if (!rowMap.has(key)) rowMap.set(key, r);
+    }
+  }
+
+  // Lectura inicial arriba
+  agregar(await leerSnapshotTabla(page));
+
+  // Hacer scroll progresivo tanto en contenedores internos con scroll como en window
+  // (resuelve tablas con Virtual Scroll donde solo existen ~25 filas en el DOM a la vez)
+  let sinNuevas = 0;
+  for (let paso = 0; paso < 45; paso++) {
+    const antes = rowMap.size;
+    const scrolled = await page.evaluate(function () {
+      let movio = false;
+      const all = Array.from(document.querySelectorAll('div, section, main, tbody, cdk-virtual-scroll-viewport'));
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i];
+        if (el.scrollHeight > el.clientHeight + 80 && el.clientHeight > 120) {
+          const prev = el.scrollTop;
+          const step = Math.max(300, Math.floor(el.clientHeight * 0.75));
+          el.scrollTop = Math.min(el.scrollHeight, prev + step);
+          if (el.scrollTop > prev + 2) movio = true;
+        }
+      }
+      const prevWin = window.scrollY;
+      window.scrollBy(0, 600);
+      if (window.scrollY > prevWin + 2) movio = true;
+      return movio;
+    });
+
+    await page.waitForTimeout(350);
+    agregar(await leerSnapshotTabla(page));
+
+    if (rowMap.size === antes) {
+      sinNuevas++;
+    } else {
+      sinNuevas = 0;
+    }
+
+    if (!scrolled && sinNuevas >= 2) break;
+    if (totalItemsReportado && rowMap.size >= totalItemsReportado) break;
+    if (sinNuevas >= 5) break;
+  }
+
+  return {
+    totalItemsReportado: totalItemsReportado,
+    headers: headers,
+    rows: Array.from(rowMap.values())
+  };
+}
+
 async function main() {
-  console.log('Iniciando sincronizacion SIGA v3...');
+  console.log('Iniciando sincronizacion SIGA v4 (con scroll completo)...');
   const resCfg = await sb.from('siga_config').select('*').eq('id', 'LIM').maybeSingle();
   if (resCfg.error) throw resCfg.error;
   const cfg = resCfg.data;
@@ -115,83 +250,15 @@ async function main() {
     console.log('Abriendo pizarra...');
     await page.goto(urlSiga, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await esperarTablaVuelos(page);
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(2500);
 
-    const extracted = await page.evaluate(function () {
-      function clean(s) {
-        return String(s || '').replace(/\s+/g, ' ').trim();
-      }
-      const tables = Array.from(document.querySelectorAll('table'));
-      let mainTable = null;
-      let maxRows = 0;
-      for (let i = 0; i < tables.length; i++) {
-        const count = tables[i].querySelectorAll('tbody tr').length;
-        if (count > maxRows) {
-          maxRows = count;
-          mainTable = tables[i];
-        }
-      }
-
-      let rows = [];
-      let headers = [];
-
-      if (mainTable && maxRows > 0) {
-        rows = Array.from(mainTable.querySelectorAll('tbody tr'))
-          .map(function (tr) {
-            return Array.from(tr.querySelectorAll('td')).map(function (td) { return clean(td.innerText); });
-          })
-          .filter(function (r) { return r.length >= 4; });
-
-        const candidateHeaderRows = Array.from(mainTable.querySelectorAll('thead tr'))
-          .concat(Array.from(document.querySelectorAll('table thead tr')));
-
-        const colCount = rows[0] ? rows[0].length : 0;
-        let bestH = [];
-        let bestScore = -1;
-        for (let j = 0; j < candidateHeaderRows.length; j++) {
-          const hs = Array.from(candidateHeaderRows[j].querySelectorAll('th, td'))
-            .map(function (el) { return clean(el.innerText).toUpperCase(); });
-          if (!hs.length) continue;
-          let score = 0;
-          if (hs.some(function (h) { return h.indexOf('VUELO') >= 0 || h === 'VOO'; })) score += 5;
-          if (hs.some(function (h) { return h.indexOf('ETA') >= 0; })) score += 3;
-          if (hs.some(function (h) { return h.indexOf('ETD') >= 0; })) score += 3;
-          if (hs.some(function (h) { return h.indexOf('PREFIX') >= 0 || h.indexOf('MATR') >= 0; })) score += 4;
-          if (colCount && hs.length === colCount) score += 6;
-          score += hs.length * 0.05;
-          if (score > bestScore) {
-            bestScore = score;
-            bestH = hs;
-          }
-        }
-        headers = bestH;
-      }
-
-      if (!rows.length) {
-        const ariaHeaders = Array.from(document.querySelectorAll('[role="columnheader"]'))
-          .map(function (el) { return clean(el.innerText).toUpperCase(); });
-        const ariaRows = Array.from(document.querySelectorAll('[role="row"]'))
-          .map(function (r) {
-            return Array.from(r.querySelectorAll('[role="cell"], [role="gridcell"]'))
-              .map(function (c) { return clean(c.innerText); });
-          })
-          .filter(function (r) { return r.length >= 4; });
-        if (ariaRows.length) {
-          headers = ariaHeaders;
-          rows = ariaRows;
-        }
-      }
-
-      return { tableCount: tables.length, headers: headers, rows: rows };
-    });
-
-    const tableCount = extracted.tableCount;
+    const extracted = await extraerTodasLasFilasConScroll(page);
+    const totalItemsReportado = extracted.totalItemsReportado;
     const headers = extracted.headers;
     const rows = extracted.rows;
 
-    console.log('Tablas en DOM: ' + tableCount + ' | Cabeceras (' + headers.length + '): ' + headers.join(' | '));
-    console.log('Filas detectadas: ' + rows.length);
-    if (rows[0]) console.log('Ejemplo fila 0: ' + JSON.stringify(rows[0]));
+    console.log('SIGA reporta: ' + (totalItemsReportado || '?') + ' ITEMS | Filas unicas capturadas tras scroll: ' + rows.length);
+    console.log('Cabeceras (' + headers.length + '): ' + headers.join(' | '));
 
     if (!rows.length) {
       await actualizarEstadoConfig({
@@ -206,7 +273,7 @@ async function main() {
     });
     if (idxPrefix < 0) {
       const counts = {};
-      rows.slice(0, 30).forEach(function (r) {
+      rows.slice(0, 40).forEach(function (r) {
         r.forEach(function (val, idx) {
           if (/^[A-Z]{2}-[A-Z0-9]{3,5}$/.test(val.trim())) {
             counts[idx] = (counts[idx] || 0) + 1;
@@ -246,6 +313,8 @@ async function main() {
 
     const hoyLima = fechaHoyLima();
     const registrosMap = new Map();
+    let arrCount = 0;
+    let depCount = 0;
     function cleanVuelo(v) { return String(v || '').replace(/\s+/g, '').toUpperCase(); }
     function cleanPea(p) { return String(p || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, ''); }
     function cleanTxt(m) { return String(m || '').replace(/\s+/g, '').toUpperCase().replace(/^-$/, ''); }
@@ -257,13 +326,14 @@ async function main() {
 
       if (idxArrVuelo >= 0) {
         const vuelo = cleanVuelo(cells[idxArrVuelo]);
-        if (vuelo && vuelo !== '-' && /[A-Z0-9]{3,}/.test(vuelo)) {
+        if (vuelo && vuelo !== '-' && /[A-Z0-9]{2,}/.test(vuelo)) {
           const rawHora = (idxArrEta >= 0 && cells[idxArrEta] && cells[idxArrEta] !== '-')
             ? cells[idxArrEta]
             : (idxArrSta >= 0 ? cells[idxArrSta] : '');
           const parsed = parseHoraFecha(rawHora, hoyLima);
           if (parsed) {
             const id = parsed.fecha + '_' + vuelo + '_ACOPLE';
+            if (!registrosMap.has(id)) arrCount++;
             registrosMap.set(id, {
               id: id,
               fecha: parsed.fecha,
@@ -281,13 +351,14 @@ async function main() {
 
       if (idxDepVuelo >= 0) {
         const vuelo = cleanVuelo(cells[idxDepVuelo]);
-        if (vuelo && vuelo !== '-' && /[A-Z0-9]{3,}/.test(vuelo)) {
+        if (vuelo && vuelo !== '-' && /[A-Z0-9]{2,}/.test(vuelo)) {
           const rawHora = (idxDepEtd >= 0 && cells[idxDepEtd] && cells[idxDepEtd] !== '-')
             ? cells[idxDepEtd]
             : (idxDepStd >= 0 ? cells[idxDepStd] : '');
           const parsed = parseHoraFecha(rawHora, hoyLima);
           if (parsed) {
             const id = parsed.fecha + '_' + vuelo + '_DESACOPLE';
+            if (!registrosMap.has(id)) depCount++;
             registrosMap.set(id, {
               id: id,
               fecha: parsed.fecha,
@@ -305,7 +376,7 @@ async function main() {
     }
 
     const registros = Array.from(registrosMap.values());
-    console.log('Eventos normalizados (Llegadas + Salidas): ' + registros.length);
+    console.log('Eventos normalizados -> Acople: ' + arrCount + ' | Desacople: ' + depCount + ' | Total: ' + registros.length);
 
     if (registros.length > 0) {
       for (let i = 0; i < registros.length; i += 100) {
