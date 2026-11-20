@@ -2,17 +2,17 @@ name: Sincronizar Pizarra SIGA
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: siga-sync-job
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   sync-siga:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,8 +20,14 @@ jobs:
           node-version: '22'
       - run: npm install
       - run: npx playwright install chromium
-      - env:
+      - name: Bucle automatico cada 4 minutos
+        env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: npm run sync
-        
+        run: |
+          for i in $(seq 1 13); do
+            echo "=== Ciclo $i de 13 ==="
+            npm run sync || echo "Error temporal en ciclo $i, reintentando en 4 min..."
+            if [ "$i" -lt 13 ]; then sleep 240; fi
+          done
+          
