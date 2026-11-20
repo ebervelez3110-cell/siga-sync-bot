@@ -1,3 +1,4 @@
+
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -51,8 +52,35 @@ async function actualizarEstadoConfig(patch) {
   await sb.from('siga_config').upsert(payload, { onConflict: 'id' });
 }
 
+async function esperarTablaVuelos(page) {
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      await page.waitForFunction(function () {
+        const txt = document.body ? document.body.innerText : '';
+        return /\b[A-Z]{2}\d{3,4}\b/.test(txt);
+      }, null, { timeout: 45000 });
+      return true;
+    } catch (e) {
+      const preview = await page.evaluate(function () {
+        return (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim().slice(0, 280);
+      }).catch(function () { return ''; });
+      console.log('Intento ' + intento + ' sin vuelos aun. Texto visible: ' + preview);
+      if (/expir|vencid|inval|unauthor|acceso|token/i.test(preview)) {
+        throw new Error('Link SIGA expirado o rechazado por servidor: ' + preview);
+      }
+      if (intento === 1) {
+        console.log('Reintentando carga de pizarra...');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+      } else {
+        throw new Error('Timeout esperando vuelos en SIGA. Texto en pantalla: ' + (preview || '(pantalla en blanco)'));
+      }
+    }
+  }
+  return false;
+}
+
 async function main() {
-  console.log('Iniciando sincronizacion SIGA v2...');
+  console.log('Iniciando sincronizacion SIGA v3...');
   const resCfg = await sb.from('siga_config').select('*').eq('id', 'LIM').maybeSingle();
   if (resCfg.error) throw resCfg.error;
   const cfg = resCfg.data;
@@ -85,13 +113,8 @@ async function main() {
     const page = await context.newPage();
 
     console.log('Abriendo pizarra...');
-    await page.goto(urlSiga, { waitUntil: 'networkidle', timeout: 60000 });
-
-    await page.waitForFunction(function () {
-      const txt = document.body ? document.body.innerText : '';
-      return /\b[A-Z]{2}\d{3,4}\b/.test(txt);
-    }, { timeout: 45000 });
-
+    await page.goto(urlSiga, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await esperarTablaVuelos(page);
     await page.waitForTimeout(3000);
 
     const extracted = await page.evaluate(function () {
@@ -221,20 +244,6 @@ async function main() {
     const idxDepEtd = findAfter(function (h) { return h === 'ETD' || h.indexOf('ETD') === 0; }, idxPrefix);
     const idxDepStd = findAfter(function (h) { return h === 'STD' || h.indexOf('STD') === 0; }, idxPrefix);
 
-    console.log('Indices detectados: ' + JSON.stringify({
-      idxPrefix: idxPrefix,
-      idxArrVuelo: idxArrVuelo,
-      idxArrOrigen: idxArrOrigen,
-      idxArrPea: idxArrPea,
-      idxArrEta: idxArrEta,
-      idxArrSta: idxArrSta,
-      idxDepVuelo: idxDepVuelo,
-      idxDepDest: idxDepDest,
-      idxDepPea: idxDepPea,
-      idxDepEtd: idxDepEtd,
-      idxDepStd: idxDepStd
-    }));
-
     const hoyLima = fechaHoyLima();
     const registrosMap = new Map();
     function cleanVuelo(v) { return String(v || '').replace(/\s+/g, '').toUpperCase(); }
@@ -297,7 +306,6 @@ async function main() {
 
     const registros = Array.from(registrosMap.values());
     console.log('Eventos normalizados (Llegadas + Salidas): ' + registros.length);
-    if (registros[0]) console.log('Muestra registro 0: ' + JSON.stringify(registros[0]));
 
     if (registros.length > 0) {
       for (let i = 0; i < registros.length; i += 100) {
@@ -315,7 +323,7 @@ async function main() {
       token_exp: expDate ? expDate.toISOString() : null,
       ultima_sync: new Date().toISOString(),
       total_vuelos: registros.length,
-      ultimo_error: registros.length > 0 ? null : 'Se leyeron filas pero 0 vuelos normalizados (revisar cabeceras en Actions).'
+      ultimo_error: registros.length > 0 ? null : 'Se leyeron filas pero 0 vuelos normalizados.'
     });
 
     console.log('Sincronizacion completada.');
